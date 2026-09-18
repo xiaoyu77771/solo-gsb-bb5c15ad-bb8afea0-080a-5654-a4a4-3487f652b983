@@ -35,6 +35,26 @@ class InvalidCIDRError(ValueError):
     """非法 CIDR（格式错误、主机位非零、IPv6 等）。"""
 
 
+class DuplicateEntriesError(ValueError):
+    """条目 id 重复，或规范化后存在相同网络的条目。
+
+    - ``duplicate_ids``：重复出现的 id 值（按首次重复的出现顺序）
+    - ``duplicate_networks``：每项为 ``{"cidr": 规范化网络, "ids": 冲突 id 列表}``，
+      冲突组按该网络首次出现的输入顺序排列
+    """
+
+    def __init__(
+        self,
+        duplicate_ids: Sequence[str],
+        duplicate_networks: Sequence[dict],
+    ) -> None:
+        self.duplicate_ids: list[str] = list(duplicate_ids)
+        self.duplicate_networks: list[dict] = list(duplicate_networks)
+        super().__init__(
+            f"重复 id={self.duplicate_ids!r}；重复网络={self.duplicate_networks!r}"
+        )
+
+
 def normalize_action(action: object) -> str:
     """规范化动作：去空白、转小写；非 allow/deny 抛出 ValueError。"""
     if not isinstance(action, str):
@@ -370,3 +390,136 @@ def compare_rule_sets(
         for (left_action, right_action), intervals in sorted(diffs.items())
     ]
     return {"equivalent": not groups, "differences": groups}
+
+
+#: /cidrs/hierarchy 允许的最大条目数
+MAX_HIERARCHY_ENTRIES = 500
+
+
+def build_cidr_hierarchy(entries: Sequence[tuple[str, str]]) -> dict:
+    """把若干 ``(id, cidr)`` 条目组织为 IPv4 CIDR 包含层级树。
+
+    每个网段选择输入中**前缀最长的严格超网**作为唯一 parent；不存在任何
+    严格超网时作为 root。每个节点给出 ``total_addresses``（网段地址总数）、
+    ``exclusive_address_count``（扣除**全部直接子节点**地址并集后独占的
+    地址数）以及 ``exclusive_cidrs``（独占地址集合无损压缩后的最少 CIDR
+    列表）。同一节点的直接子节点两两不相交，故并集即区间直接相减。
+
+    树与每个节点的子节点均按 ``(网络地址升序, 前缀长度升序, 输入顺序)``
+    稳定排列。返回可直接 JSON 序列化的结果字典。
+
+    条目为空、超过 :data:`MAX_HIERARCHY_ENTRIES` 个、id 非非空字符串、
+    CIDR 非法时抛出 :class:`ValueError`；id 重复或规范化后网络相同抛出
+    :class:`DuplicateEntriesError`。全程只做整数区间运算，不逐地址枚举。
+    """
+    if not entries:
+        raise ValueError("条目列表不能为空")
+    if len(entries) > MAX_HIERARCHY_ENTRIES:
+        raise ValueError(f"条目数量不能超过 {MAX_HIERARCHY_ENTRIES} 个")
+
+    nodes: list[dict] = []
+    seen_ids: set[str] = set()
+    duplicate_ids: list[str] = []
+    seen_networks: dict[tuple[int, int], dict] = {}
+    duplicate_networks: list[dict] = []
+
+    for order, (entry_id, raw_cidr) in enumerate(entries):
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            raise ValueError(f"非法 id: {entry_id!r}（必须是非空字符串）")
+        start, end, cidr = parse_cidr_v4(raw_cidr)
+        prefixlen = 32 - ((end - start + 1).bit_length() - 1)
+
+        if entry_id in seen_ids and entry_id not in duplicate_ids:
+            duplicate_ids.append(entry_id)
+        seen_ids.add(entry_id)
+
+        key = (start, prefixlen)
+        network_group = seen_networks.get(key)
+        if network_group is None:
+            seen_networks[key] = {"cidr": cidr, "first": order, "ids": [entry_id]}
+        else:
+            network_group["ids"].append(entry_id)
+            if len(network_group["ids"]) == 2:
+                duplicate_networks.append(network_group)
+
+        nodes.append(
+            {
+                "id": entry_id,
+                "cidr": cidr,
+                "order": order,
+                "start": start,
+                "end": end,
+                "prefixlen": prefixlen,
+            }
+        )
+
+    if duplicate_ids or duplicate_networks:
+        raise DuplicateEntriesError(
+            duplicate_ids,
+            [
+                {"cidr": group["cidr"], "ids": list(group["ids"])}
+                for group in duplicate_networks
+            ],
+        )
+
+    # 为每个节点选取前缀最长的严格超网作为唯一 parent：
+    # 候选中前缀长度最大者；同一前缀长度不可能同时包含第三个不同网络，
+    # 因此最长超网天然唯一。
+    for index, node in enumerate(nodes):
+        parent = None
+        for other_index, other in enumerate(nodes):
+            if other_index == index:
+                continue
+            if (
+                other["start"] <= node["start"]
+                and other["end"] >= node["end"]
+                and other["prefixlen"] < node["prefixlen"]
+            ):
+                if parent is None or other["prefixlen"] > nodes[parent]["prefixlen"]:
+                    parent = other_index
+        node["parent"] = parent
+
+    children: dict[int, list[int]] = {index: [] for index in range(len(nodes))}
+    roots: list[int] = []
+    for index, node in enumerate(nodes):
+        if node["parent"] is None:
+            roots.append(index)
+        else:
+            children[node["parent"]].append(index)
+
+    sort_key = lambda index: (
+        nodes[index]["start"],
+        nodes[index]["prefixlen"],
+        nodes[index]["order"],
+    )
+    roots.sort(key=sort_key)
+    for child_list in children.values():
+        child_list.sort(key=sort_key)
+
+    def build_node(index: int) -> dict:
+        node = nodes[index]
+        child_indices = children[index]
+        child_intervals = [
+            (nodes[child]["start"], nodes[child]["end"])
+            for child in child_indices
+        ]
+        exclusive = subtract_covered(
+            (node["start"], node["end"]),
+            merge_intervals(child_intervals),
+        )
+        exclusive_cidrs = compress_intervals(exclusive)
+        exclusive_count = sum(end - start + 1 for start, end in exclusive)
+        return {
+            "id": node["id"],
+            "cidr": node["cidr"],
+            "total_addresses": node["end"] - node["start"] + 1,
+            "exclusive_address_count": exclusive_count,
+            "exclusive_cidrs": exclusive_cidrs,
+            "children": [build_node(child) for child in child_indices],
+        }
+
+    return {
+        "entry_count": len(entries),
+        "root_count": len(roots),
+        "roots": [build_node(index) for index in roots],
+    }
