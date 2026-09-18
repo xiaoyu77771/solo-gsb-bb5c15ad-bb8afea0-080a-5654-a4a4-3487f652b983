@@ -5,9 +5,12 @@ import pytest
 from ipaddress import IPv4Address, IPv4Network, collapse_addresses, ip_network
 
 from app.analyzer import (
+    HIERARCHY_MAX_ENTRIES,
+    HierarchyInputError,
     InvalidCIDRError,
     V4_SPACE,
     analyze_rules,
+    build_cidr_hierarchy,
     build_decision_intervals,
     compare_rule_sets,
     compress_intervals,
@@ -599,3 +602,263 @@ def test_explain_random_rules_oracle():
 
         # 不重不漏覆盖整个 query
         assert sum(item["address_count"] for item in attribution) == 256
+
+
+# ---------- CIDR 包含层级（build_cidr_hierarchy） ----------
+
+def _flatten(nodes):
+    """先根遍历展平森林。"""
+    out = []
+    for node in nodes:
+        out.append(node)
+        out.extend(_flatten(node["children"]))
+    return out
+
+
+def _oracle_exclusive(entries):
+    """用 ipaddress 计算 {id: 独占地址集合} 与 {id: 父节点对象或 None}。"""
+    parsed = [(eid, ip_network(cidr)) for eid, cidr in entries]
+    parents = {}
+    exclusive = {}
+    for eid, net in parsed:
+        supers = [
+            (other.prefixlen, other_id)
+            for other_id, other in parsed
+            if other_id != eid
+            and other.version == net.version
+            and other.supernet_of(net)
+        ]
+        if supers:
+            # 前缀最长的严格超网唯一（无同网段重复前提）
+            parents[eid] = max(supers)[1]
+        else:
+            parents[eid] = None
+        child_union: set = set()
+        for other_id, other in parsed:
+            if parents.get(other_id) == eid:
+                child_union |= set(other)
+        exclusive[eid] = set(net) - child_union
+    return parents, exclusive
+
+
+def test_hierarchy_basic_nesting_and_exclusive_cidrs():
+    result = build_cidr_hierarchy(
+        [
+            ("root", "10.0.0.0/8"),
+            ("mid", "10.1.0.0/16"),
+            ("leaf1", "10.1.1.0/24"),
+            ("leaf2", "10.1.2.0/24"),
+            ("other", "10.2.0.0/16"),
+        ]
+    )
+    assert result["node_count"] == 5
+    assert result["root_count"] == 1
+    root = result["roots"][0]
+    assert root["id"] == "root"
+    assert root["parent_id"] is None
+    assert root["total_addresses"] == 1 << 24
+    assert root["exclusive_address_count"] == (1 << 24) - 2 * (1 << 16)
+    # 独占集合：/8 挖掉两个直接子 /16（10.1/16、10.2/16）
+    assert root["exclusive_cidrs"] == [
+        "10.0.0.0/16",
+        "10.3.0.0/16",
+        "10.4.0.0/14",
+        "10.8.0.0/13",
+        "10.16.0.0/12",
+        "10.32.0.0/11",
+        "10.64.0.0/10",
+        "10.128.0.0/9",
+    ]
+
+    mid, other = root["children"]
+    assert mid["id"] == "mid" and mid["parent_id"] == "root"
+    assert other["id"] == "other" and other["parent_id"] == "root"
+    # 叶子为孙节点，不计入 mid 的直接子并集之外：扣除两个 /24
+    assert mid["exclusive_address_count"] == (1 << 16) - 2 * (1 << 8)
+    assert [c["id"] for c in mid["children"]] == ["leaf1", "leaf2"]
+    for leaf in mid["children"]:
+        assert leaf["parent_id"] == "mid"
+        assert leaf["exclusive_address_count"] == 256
+        assert leaf["exclusive_cidrs"] == [leaf["cidr"]]
+        assert leaf["children"] == []
+    # other 无直接子节点：独占整个自身网段
+    assert other["exclusive_address_count"] == 1 << 16
+    assert other["exclusive_cidrs"] == ["10.2.0.0/16"]
+
+
+def test_hierarchy_longest_prefix_supernet_wins():
+    # /8、/16、/24 三级：/24 的 parent 必须是 /16 而非 /8
+    result = build_cidr_hierarchy(
+        [("a", "10.0.0.0/8"), ("b", "10.1.0.0/16"), ("c", "10.1.0.0/24")]
+    )
+    flat = {n["id"]: n for n in _flatten(result["roots"])}
+    assert flat["a"]["parent_id"] is None
+    assert flat["b"]["parent_id"] == "a"
+    assert flat["c"]["parent_id"] == "b"
+
+
+def test_hierarchy_multiple_roots_and_sibling_order():
+    result = build_cidr_hierarchy(
+        [
+            # 输入故意乱序；兄弟必须按 (网络地址, 前缀长度, 输入序号) 排
+            ("n2", "192.168.0.0/16"),
+            ("n0", "8.8.8.8/32"),
+            ("n1", "10.0.0.0/8"),
+        ]
+    )
+    assert result["root_count"] == 3
+    assert [n["id"] for n in result["roots"]] == ["n0", "n1", "n2"]
+    # 全为 root，各自独占自身
+    for node in result["roots"]:
+        assert node["parent_id"] is None
+        assert node["exclusive_address_count"] == node["total_addresses"]
+        assert node["exclusive_cidrs"] == [node["cidr"]]
+
+
+def test_hierarchy_slash0_is_root_and_excludes_direct_children():
+    result = build_cidr_hierarchy(
+        [("inside", "10.0.0.0/8"), ("outside", "8.8.8.8/32"), ("all", "0.0.0.0/0")]
+    )
+    assert result["root_count"] == 1
+    root = result["roots"][0]
+    assert root["cidr"] == "0.0.0.0/0"
+    assert root["total_addresses"] == 1 << 32
+    # 独占 = 全空间扣除两个直接子节点并集
+    assert root["exclusive_address_count"] == (1 << 32) - (1 << 24) - 1
+    assert sum(
+        IPv4Network(c).num_addresses for c in root["exclusive_cidrs"]
+    ) == root["exclusive_address_count"]
+    assert [c["id"] for c in root["children"]] == ["outside", "inside"]
+
+
+def test_hierarchy_bare_ip_normalized_to_32():
+    result = build_cidr_hierarchy([("h", "8.8.8.8"), ("net", "8.8.8.0/24")])
+    flat = {n["id"]: n for n in _flatten(result["roots"])}
+    assert flat["h"]["cidr"] == "8.8.8.8/32"
+    assert flat["h"]["parent_id"] == "net"
+    assert flat["net"]["parent_id"] is None
+
+
+def test_hierarchy_input_order_tiebreak_is_stable():
+    # 相同网络地址、不同前缀（严格包含）：兄弟按 (网络地址, 前缀长度, 输入序号) 排
+    result = build_cidr_hierarchy(
+        [("p", "10.128.0.0/9"), ("q", "10.0.0.0/8"), ("r", "11.0.0.0/8")]
+    )
+    # q(10/8) 与 r(11/8) 不相交，均为 root；p(10.128/9) 是 q 的子节点
+    assert [n["cidr"] for n in result["roots"]] == ["10.0.0.0/8", "11.0.0.0/8"]
+    q = result["roots"][0]
+    assert [c["cidr"] for c in q["children"]] == ["10.128.0.0/9"]
+
+
+def test_hierarchy_integer_ids_preserved():
+    result = build_cidr_hierarchy([(7, "10.0.0.0/8"), (0, "10.1.0.0/16")])
+    flat = {n["id"]: n for n in _flatten(result["roots"])}
+    assert set(flat) == {7, 0}
+    assert flat[0]["parent_id"] == 7
+    assert flat[7]["parent_id"] is None
+
+
+def test_hierarchy_duplicate_network_raises_and_lists_ids():
+    with pytest.raises(HierarchyInputError) as exc:
+        build_cidr_hierarchy(
+            [("a", "10.0.0.0/8"), ("b", "10.0.0.0/08"), ("c", "8.8.8.8/32")]
+        )
+    assert exc.value.duplicate_ids == []
+    assert exc.value.duplicate_networks == [
+        {
+            "cidr": "10.0.0.0/8",
+            "entries": [
+                {"index": 0, "id": "a", "cidr": "10.0.0.0/8"},
+                {"index": 1, "id": "b", "cidr": "10.0.0.0/8"},
+            ],
+        }
+    ]
+
+
+def test_hierarchy_duplicate_id_raises_and_lists_indexes():
+    with pytest.raises(HierarchyInputError) as exc:
+        build_cidr_hierarchy(
+            [("x", "10.0.0.0/8"), ("x", "11.0.0.0/8"), ("y", "8.8.8.8/32"),
+             ("x", "12.0.0.0/8")]
+        )
+    assert exc.value.duplicate_ids == [{"id": "x", "indexes": [0, 1, 3]}]
+    assert exc.value.duplicate_networks == []
+
+
+def test_hierarchy_rejects_bad_ids_out_of_range_and_invalid_cidrs():
+    with pytest.raises(ValueError):
+        build_cidr_hierarchy([(True, "10.0.0.0/8")])
+    with pytest.raises(ValueError):
+        build_cidr_hierarchy([("   ", "10.0.0.0/8")])
+    with pytest.raises(ValueError):
+        build_cidr_hierarchy([])
+    with pytest.raises(ValueError):
+        build_cidr_hierarchy(
+            [(i, f"1.0.{i // 256}.{i % 256}/32") for i in range(HIERARCHY_MAX_ENTRIES + 1)]
+        )
+    with pytest.raises(InvalidCIDRError):
+        build_cidr_hierarchy([("a", "10.0.0.1/8")])
+    with pytest.raises(InvalidCIDRError):
+        build_cidr_hierarchy([("a", "2001:db8::/32")])
+
+
+def test_hierarchy_random_oracle():
+    """与 ipaddress oracle 对比：父节点、独占集合、最少 CIDR、稳定次序。"""
+    rng = random.Random(20260918)
+    base = ip_network("10.0.0.0/16")
+    # 多种前缀长度的候选池（对齐、互不重复），抽样后可形成任意嵌套
+    pool = [
+        net
+        for prefixlen in range(17, 31)
+        for net in base.subnets(new_prefix=prefixlen)
+    ]
+    for _ in range(60):
+        picked = rng.sample(pool, k=rng.randint(1, 14))
+        entries = [(f"n{i}", str(net)) for i, net in enumerate(picked)]
+        result = build_cidr_hierarchy(entries)
+        expected_parents, expected_exclusive = _oracle_exclusive(entries)
+
+        flat = _flatten(result["roots"])
+        assert len(flat) == len(picked)
+        by_id = {n["id"]: n for n in flat}
+
+        # 全部地址数守恒：所有节点独占集合互不相交且覆盖全部输入并集
+        covered = set()
+        for node in flat:
+            assert node["parent_id"] == expected_parents[node["id"]]
+            addresses = expected_exclusive[node["id"]]
+            assert node["exclusive_address_count"] == len(addresses)
+            expected_cidrs = [
+                str(c)
+                for c in collapse_addresses(
+                    [ip_network(f"{IPv4Address(v)}/32") for v in addresses]
+                )
+            ]
+            assert node["exclusive_cidrs"] == expected_cidrs
+            rebuilt = set()
+            for cidr in node["exclusive_cidrs"]:
+                rebuilt |= set(ip_network(cidr))
+            assert rebuilt == addresses  # 无损
+            assert not rebuilt & covered  # 独占集合两两不相交
+            covered |= rebuilt
+            assert node["total_addresses"] == ip_network(node["cidr"]).num_addresses
+
+        assert covered == set().union(*[set(n) for n in picked])        # 结构：children 与 parent_id 一致，且整树有序
+        for node in flat:
+            parent = by_id.get(node["parent_id"]) if node["parent_id"] is not None else None
+            if parent is None:
+                assert node in result["roots"]
+            else:
+                assert node in parent["children"]
+
+        def check_order(nodes):
+            keys = [
+                (int(ip_network(n["cidr"]).network_address),
+                 ip_network(n["cidr"]).prefixlen)
+                for n in nodes
+            ]
+            assert keys == sorted(keys)
+            for n in nodes:
+                check_order(n["children"])
+
+        check_order(result["roots"])

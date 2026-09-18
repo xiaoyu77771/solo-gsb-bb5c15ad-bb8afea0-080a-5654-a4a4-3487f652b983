@@ -323,3 +323,187 @@ def test_explain_validation_422():
     assert post_explain(
         [{"action": "allow", "cidr": "10.0.0.1/8"}], "deny", "10.0.0.0/8"
     ).status_code == 422
+
+
+# ---------- /cidrs/hierarchy ----------
+
+def post_hierarchy(entries):
+    return client.post("/cidrs/hierarchy", json={"entries": entries})
+
+
+def test_hierarchy_basic_tree():
+    resp = post_hierarchy(
+        [
+            {"id": "net", "cidr": "10.0.0.0/8"},
+            {"id": "sub", "cidr": "10.1.0.0/16"},
+            {"id": "host", "cidr": "10.1.1.1"},
+            {"id": "other", "cidr": "8.8.8.0/24"},
+        ]
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["node_count"] == 4
+    assert body["root_count"] == 2
+
+    # 根按网络地址稳定排序：8.8.8.0/24 在 10.0.0.0/8 之前
+    other, net = body["roots"]
+    assert other["id"] == "other"
+    assert other["cidr"] == "8.8.8.0/24"
+    assert other["parent_id"] is None
+    assert other["children"] == []
+    assert other["total_addresses"] == 256
+    assert other["exclusive_address_count"] == 256
+    assert other["exclusive_cidrs"] == ["8.8.8.0/24"]
+
+    assert net["id"] == "net"
+    assert net["cidr"] == "10.0.0.0/8"
+    assert net["parent_id"] is None
+    assert net["total_addresses"] == 1 << 24
+    # /8 的直接子节点仅 10.1.0.0/16（host 是孙节点，不重复扣除）
+    assert net["exclusive_address_count"] == (1 << 24) - (1 << 16)
+
+    sub = net["children"][0]
+    assert sub["id"] == "sub"
+    assert sub["parent_id"] == "net"
+    assert sub["total_addresses"] == 1 << 16
+    # /16 扣除直接子节点 10.1.1.1/32
+    assert sub["exclusive_address_count"] == (1 << 16) - 1
+    assert sub["exclusive_cidrs"][0] == "10.1.0.0/24"
+
+    host = sub["children"][0]
+    assert host["id"] == "host"
+    assert host["cidr"] == "10.1.1.1/32"  # 纯 IP 规范化为 /32
+    assert host["parent_id"] == "sub"
+    assert host["total_addresses"] == 1
+    assert host["exclusive_address_count"] == 1
+    assert host["exclusive_cidrs"] == ["10.1.1.1/32"]
+    assert host["children"] == []
+
+
+def test_hierarchy_longest_prefix_supernet_is_parent():
+    resp = post_hierarchy(
+        [
+            {"id": "a", "cidr": "10.0.0.0/8"},
+            {"id": "b", "cidr": "10.1.0.0/16"},
+            {"id": "c", "cidr": "10.1.2.0/24"},
+        ]
+    )
+    assert resp.status_code == 200
+    roots = resp.json()["roots"]
+    assert [n["id"] for n in roots] == ["a"]
+    b = roots[0]["children"][0]
+    assert b["id"] == "b"
+    # /24 的唯一 parent 是前缀最长的严格超网 /16，而非 /8
+    assert [c["id"] for c in b["children"]] == ["c"]
+    assert b["children"][0]["parent_id"] == "b"
+
+
+def test_hierarchy_integer_ids_and_root_order():
+    resp = post_hierarchy(
+        [
+            {"id": 2, "cidr": "192.168.0.0/16"},
+            {"id": 1, "cidr": "10.0.0.0/8"},
+        ]
+    )
+    assert resp.status_code == 200
+    assert [n["id"] for n in resp.json()["roots"]] == [1, 2]
+
+
+def test_hierarchy_duplicate_network_422_lists_ids():
+    resp = post_hierarchy(
+        [
+            {"id": "a", "cidr": "10.0.0.0/8"},
+            {"id": "b", "cidr": "10.0.0.0/08"},  # 规范化后与 a 相同
+            {"id": "c", "cidr": "8.8.8.8/32"},
+        ]
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "duplicate_entries"
+    assert detail["duplicate_ids"] == []
+    assert detail["duplicate_networks"] == [
+        {
+            "cidr": "10.0.0.0/8",
+            "entries": [
+                {"index": 0, "id": "a", "cidr": "10.0.0.0/8"},
+                {"index": 1, "id": "b", "cidr": "10.0.0.0/8"},
+            ],
+        }
+    ]
+
+
+def test_hierarchy_duplicate_id_422_lists_indexes():
+    resp = post_hierarchy(
+        [
+            {"id": "x", "cidr": "10.0.0.0/8"},
+            {"id": "x", "cidr": "11.0.0.0/8"},
+            {"id": 5, "cidr": "12.0.0.0/8"},
+            {"id": 5, "cidr": "13.0.0.0/8"},
+        ]
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "duplicate_entries"
+    assert detail["duplicate_ids"] == [
+        {"id": "x", "indexes": [0, 1]},
+        {"id": 5, "indexes": [2, 3]},
+    ]
+    assert detail["duplicate_networks"] == []
+
+
+def test_hierarchy_both_duplicates_reported_together():
+    resp = post_hierarchy(
+        [
+            {"id": "x", "cidr": "10.0.0.0/8"},
+            {"id": "x", "cidr": "10.0.0.0/8"},
+        ]
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert len(detail["duplicate_ids"]) == 1
+    assert len(detail["duplicate_networks"]) == 1
+
+
+def test_hierarchy_validation_422():
+    # 空列表 / 缺少 entries
+    assert post_hierarchy([]).status_code == 422
+    assert client.post("/cidrs/hierarchy", json={}).status_code == 422
+
+    # 超过 500 条
+    too_many = [{"id": i, "cidr": f"1.0.{i // 256}.{i % 256}/32"} for i in range(501)]
+    assert post_hierarchy(too_many).status_code == 422
+
+    # 非法 CIDR / IPv6（沿用现有严格校验）
+    for bad in ["10.0.0.1/8", "10.0.0.0/33", "garbage", "2001:db8::/32", "::1"]:
+        assert post_hierarchy([{"id": "a", "cidr": bad}]).status_code == 422, bad
+
+    # 非法 id：bool / float / 对象 / 空字符串 / 缺字段
+    for bad_id in [True, 1.5, ["x"], {"k": 1}, "   "]:
+        assert post_hierarchy(
+            [{"id": bad_id, "cidr": "10.0.0.0/8"}]
+        ).status_code == 422, bad_id
+    assert post_hierarchy([{"cidr": "10.0.0.0/8"}]).status_code == 422
+    assert post_hierarchy([{"id": "a"}]).status_code == 422
+
+
+def test_hierarchy_max_500_entries_accepted():
+    entries = [
+        {"id": i, "cidr": f"1.0.{i // 256}.{i % 256}/32"} for i in range(500)
+    ]
+    resp = post_hierarchy(entries)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["node_count"] == 500
+    # 500 个互不相交的 /32：全部为 root，独占 1 个地址
+    assert body["root_count"] == 500
+    assert all(n["exclusive_address_count"] == 1 for n in body["roots"])
+    # 按网络地址稳定排序（与输入顺序一致）
+    assert [n["id"] for n in body["roots"]] == list(range(500))
+
+
+def test_hierarchy_existing_endpoints_unchanged():
+    # 新接口不影响既有接口
+    assert client.get("/health").status_code == 200
+    resp = post_analyze([{"action": "allow", "cidr": "10.0.0.0/8"}])
+    assert resp.status_code == 200
+    assert resp.json()["rules"][0]["status"] == "full"

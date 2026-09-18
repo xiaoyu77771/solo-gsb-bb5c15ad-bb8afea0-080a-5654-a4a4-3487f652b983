@@ -1,14 +1,17 @@
-"""FastAPI 应用：IPv4 CIDR 遮蔽分析与规则集等价性比较 API。"""
+"""FastAPI 应用：IPv4 CIDR 遮蔽分析、规则集等价性比较与包含层级分析 API。"""
 from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field, field_validator
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 
 from .analyzer import (
+    HIERARCHY_MAX_ENTRIES,
+    HierarchyInputError,
     InvalidCIDRError,
     analyze_rules,
+    build_cidr_hierarchy,
     compare_rule_sets,
     explain_query,
     parse_cidr_v4,
@@ -21,9 +24,10 @@ app = FastAPI(
         "地址集合，按 **全生效 (full)** / **部分遮蔽 (partial)** / "
         "**完全遮蔽 (shadowed)** 分类，并将剩余集合无损压缩为数量最少的 CIDR；"
         "也可通过 /compare 比较两组规则在整个 IPv4 空间上的最终判定是否等价，"
-        "或通过 /explain 解释一段地址空间由哪条规则或默认动作最终裁决。"
+        "通过 /explain 解释一段地址空间由哪条规则或默认动作最终裁决，"
+        "或通过 /cidrs/hierarchy 分析一组 CIDR 的包含层级（森林）与独占地址。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -172,6 +176,83 @@ class ExplainResponse(BaseModel):
     )
 
 
+# ---------- /cidrs/hierarchy ----------
+
+#: 层级条目 id：非空字符串或整数（bool 明确拒绝，不做隐式类型转换）
+EntryId = StrictStr | StrictInt
+
+
+class CidrEntry(BaseModel):
+    """单个层级条目：唯一 id + 严格 IPv4 CIDR。"""
+
+    id: EntryId = Field(..., description="条目标识，字符串或整数，全请求内唯一")
+    cidr: str = Field(
+        ...,
+        description="IPv4 CIDR，如 10.0.0.0/8；纯 IP 按 /32 处理；禁止 IPv6",
+    )
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: object) -> object:
+        # 防御性校验：pydantic StrictStr|StrictInt 已拦截 bool/float 等，
+        # 这里兜底拒绝空白字符串（独立使用 analyzer 时同样由核心层校验）
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError("id 仅支持字符串或整数")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("id 不能为空字符串")
+        return value
+
+    @field_validator("cidr")
+    @classmethod
+    def validate_cidr(cls, value: str) -> str:
+        # 校验并规范化；非法 CIDR / IPv6 抛出 ValueError -> 422
+        return parse_cidr_v4(value)[2]
+
+
+class HierarchyRequest(BaseModel):
+    """层级分析请求：1～500 个含 id 与 cidr 的条目。"""
+
+    entries: list[CidrEntry] = Field(
+        ...,
+        min_length=1,
+        max_length=HIERARCHY_MAX_ENTRIES,
+        description="含 id 与 cidr 的条目列表（1～500 个）",
+    )
+
+
+class HierarchyNode(BaseModel):
+    id: EntryId = Field(..., description="条目 id")
+    cidr: str = Field(..., description="规范化后的条目 CIDR")
+    parent_id: EntryId | None = Field(
+        ..., description="唯一父节点 id（前缀最长的严格超网）；根节点为 null"
+    )
+    total_addresses: int = Field(..., description="本网段覆盖的地址总数")
+    exclusive_address_count: int = Field(
+        ...,
+        description="自身范围扣除全部直接子节点并集后的独占地址数",
+    )
+    exclusive_cidrs: list[str] = Field(
+        ...,
+        description="独占地址集合无损压缩后的最少 CIDR 列表（无子节点时为本网段自身）",
+    )
+    children: list["HierarchyNode"] = Field(
+        ...,
+        description="直接子节点列表，按网络地址、前缀长度、输入顺序稳定排序",
+    )
+
+
+class HierarchyResponse(BaseModel):
+    node_count: int = Field(..., description="节点（条目）总数")
+    root_count: int = Field(..., description="根节点数量")
+    roots: list[HierarchyNode] = Field(
+        ...,
+        description="根节点组成的森林，按网络地址、前缀长度、输入顺序稳定排序",
+    )
+
+
+HierarchyNode.model_rebuild()
+
+
 @app.get("/", tags=["meta"])
 def root() -> dict:
     """服务信息。"""
@@ -253,6 +334,42 @@ def explain(request: ExplainRequest) -> dict:
             request.default_action,
             request.query,
         )
+    except InvalidCIDRError:
+        # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
+        raise
+
+
+@app.post(
+    "/cidrs/hierarchy",
+    response_model=HierarchyResponse,
+    tags=["hierarchy"],
+    summary="分析一组 IPv4 CIDR 的包含层级（森林）与各节点独占地址",
+)
+def cidr_hierarchy(request: HierarchyRequest) -> dict:
+    """对每个网段选择输入中前缀最长的严格超网作为唯一 parent，没有则为 root。
+
+    - 每个节点给出 ``total_addresses``；
+    - ``exclusive_address_count`` / ``exclusive_cidrs`` 为自身范围扣除
+      **全部直接子节点**并集后的独占地址集合，无损、数量最少；
+    - 返回按网络地址、前缀长度、输入顺序稳定排列的树（兄弟有序的森林）。
+
+    id 必须唯一；规范化后网段相同的条目（如 ``10.0.0.0/8`` 与
+    ``10.0.0.0/08``）返回 **422** 并列出冲突 id；非法 CIDR / IPv6 同样 422。
+    """
+    try:
+        return build_cidr_hierarchy(
+            [(entry.id, entry.cidr) for entry in request.entries]
+        )
+    except HierarchyInputError as exc:
+        # 重复 id / 规范化后重复网段：422 并列出冲突 id
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "duplicate_entries",
+                "duplicate_ids": exc.duplicate_ids,
+                "duplicate_networks": exc.duplicate_networks,
+            },
+        ) from exc
     except InvalidCIDRError:
         # 正常情况下 pydantic 已在入口拦截，这里兜底转为 422
         raise

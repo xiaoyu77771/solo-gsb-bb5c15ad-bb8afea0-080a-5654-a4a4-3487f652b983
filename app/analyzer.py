@@ -11,6 +11,7 @@ IPv4 CIDR 列表，并按覆盖比例分类：
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from ipaddress import IPv4Address, IPv4Network, ip_network
 from typing import Iterable, Sequence
 
@@ -33,6 +34,29 @@ STATUS_LABELS = {
 
 class InvalidCIDRError(ValueError):
     """非法 CIDR（格式错误、主机位非零、IPv6 等）。"""
+
+
+class HierarchyInputError(ValueError):
+    """层级分析输入不合法：id 重复，或规范化后网段重复。
+
+    ``duplicate_ids`` 给出冲突 id 及其所有出现位置（按首次出现排序）；
+    ``duplicate_networks`` 给出每个规范化网段下的全部条目（按网络地址
+    排序），每条形如 ``{"index", "id", "cidr"}``。
+    """
+
+    def __init__(
+        self,
+        duplicate_ids: list[dict],
+        duplicate_networks: list[dict],
+    ) -> None:
+        self.duplicate_ids = duplicate_ids
+        self.duplicate_networks = duplicate_networks
+        parts = []
+        if duplicate_ids:
+            parts.append(f"{len(duplicate_ids)} 个重复 id")
+        if duplicate_networks:
+            parts.append(f"{len(duplicate_networks)} 个规范化后重复的网段")
+        super().__init__("；".join(parts) or "层级分析输入不合法")
 
 
 def normalize_action(action: object) -> str:
@@ -370,3 +394,144 @@ def compare_rule_sets(
         for (left_action, right_action), intervals in sorted(diffs.items())
     ]
     return {"equivalent": not groups, "differences": groups}
+
+
+# ---------- CIDR 包含层级（/cidrs/hierarchy） ----------
+
+#: 层级分析允许的最大条目数
+HIERARCHY_MAX_ENTRIES = 500
+
+
+def _validate_hierarchy_id(raw_id: object) -> object:
+    """校验单个层级条目的 id：仅接受非空字符串或非 bool 整数。
+
+    字符串仅做首尾空白检查（不做截断）；bool 是 int 的子类，明确拒绝。
+    """
+    if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)):
+        raise ValueError(f"非法 id: {raw_id!r}（仅支持字符串或整数）")
+    if isinstance(raw_id, str) and not raw_id.strip():
+        raise ValueError("id 不能为空字符串")
+    return raw_id
+
+
+def build_cidr_hierarchy(
+    entries: Sequence[tuple[object, str]],
+) -> dict:
+    """构建 IPv4 CIDR 条目的包含层级（森林）。
+
+    每个条目的唯一 parent = 输入中**前缀最长的严格超网**；不存在严格超网
+    的条目作为 root。每个节点还给出 ``total_addresses``（自身网段地址数）、
+    ``exclusive_address_count``（自身范围扣除**全部直接子节点**并集后的
+    地址数）以及该独占集合无损压缩、数量最少的 ``exclusive_cidrs``。
+
+    树按 ``(网络地址升序, 前缀长度升序, 输入序号升序)`` 稳定排列（先根
+    遍历的兄弟顺序）。全程基于整数区间运算，不逐地址枚举。
+
+    重复 id 或规范化后网段重复时抛出 :class:`HierarchyInputError`，
+    非法 CIDR 抛出 :class:`InvalidCIDRError`。
+    """
+    if not 1 <= len(entries) <= HIERARCHY_MAX_ENTRIES:
+        raise ValueError(
+            f"条目数必须在 1..{HIERARCHY_MAX_ENTRIES} 之间，实际 {len(entries)}"
+        )
+
+    nodes: list[dict] = []
+    by_id: dict[object, list[int]] = defaultdict(list)
+    by_network: dict[tuple[int, int], list[int]] = defaultdict(list)
+
+    for index, (raw_id, raw_cidr) in enumerate(entries):
+        entry_id = _validate_hierarchy_id(raw_id)
+        start, end, cidr = parse_cidr_v4(raw_cidr)
+        prefixlen = int(cidr.rsplit("/", 1)[1])
+        nodes.append(
+            {
+                "index": index,
+                "id": entry_id,
+                "cidr": cidr,
+                "start": start,
+                "end": end,
+                "prefixlen": prefixlen,
+            }
+        )
+        by_id[entry_id].append(index)
+        by_network[(start, end)].append(index)
+
+    # by_id 按 id 首次出现的顺序插入，重复组天然按首次位置有序
+    duplicate_ids = [
+        {"id": nodes[indexes[0]]["id"], "indexes": indexes}
+        for indexes in by_id.values()
+        if len(indexes) > 1
+    ]
+
+    network_groups = [
+        idxs for idxs in by_network.values() if len(idxs) > 1
+    ]
+
+    def network_order(idxs: list[int]) -> tuple[int, int]:
+        return nodes[idxs[0]]["start"], nodes[idxs[0]]["end"]
+
+    duplicate_networks = [
+        {
+            "cidr": nodes[indexes[0]]["cidr"],
+            "entries": [
+                {"index": i, "id": nodes[i]["id"], "cidr": nodes[i]["cidr"]}
+                for i in indexes
+            ],
+        }
+        for indexes in sorted(network_groups, key=network_order)
+    ]
+    if duplicate_ids or duplicate_networks:
+        raise HierarchyInputError(duplicate_ids, duplicate_networks)
+
+    # 选择前缀最长的严格超网作为唯一 parent；同一网段的重复已在上面排除，
+    # 因此“最长前缀严格超网”至多只有一个。
+    parents: list[int | None] = []
+    for node in nodes:
+        parent_idx: int | None = None
+        parent_prefix = -1
+        for candidate in nodes:
+            if (
+                candidate["start"] <= node["start"]
+                and candidate["end"] >= node["end"]
+                and candidate["prefixlen"] < node["prefixlen"]
+            ):
+                if candidate["prefixlen"] > parent_prefix:
+                    parent_prefix = candidate["prefixlen"]
+                    parent_idx = candidate["index"]
+        parents.append(parent_idx)
+
+    children: dict[int | None, list[int]] = defaultdict(list)
+    for index, parent_idx in enumerate(parents):
+        children[parent_idx].append(index)
+
+    def order_key(idx: int) -> tuple[int, int, int]:
+        return nodes[idx]["start"], nodes[idx]["prefixlen"], nodes[idx]["index"]
+
+    for siblings in children.values():
+        siblings.sort(key=order_key)
+
+    def build_node(index: int) -> dict:
+        node = nodes[index]
+        parent_idx = parents[index]
+        child_indices = children.get(index, [])
+        child_intervals = [
+            (nodes[c]["start"], nodes[c]["end"]) for c in child_indices
+        ]
+        # 直接子节点两两不相交（同层网络不可能严格包含），合并仅用于规范化
+        exclusive = subtract_covered(
+            (node["start"], node["end"]),
+            merge_intervals(child_intervals),
+        )
+        exclusive_count = sum(b - a + 1 for a, b in exclusive)
+        return {
+            "id": node["id"],
+            "cidr": node["cidr"],
+            "parent_id": None if parent_idx is None else nodes[parent_idx]["id"],
+            "total_addresses": node["end"] - node["start"] + 1,
+            "exclusive_address_count": exclusive_count,
+            "exclusive_cidrs": compress_intervals(exclusive),
+            "children": [build_node(c) for c in child_indices],
+        }
+
+    roots = [build_node(i) for i in children.get(None, [])]
+    return {"node_count": len(nodes), "root_count": len(roots), "roots": roots}
